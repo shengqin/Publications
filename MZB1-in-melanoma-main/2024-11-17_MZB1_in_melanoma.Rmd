@@ -1,0 +1,891 @@
+---
+title: "MZB1-in-melanoma"
+author: "Shengqin Su"
+date: "2024-11-07"
+output: html_notebook
+---
+
+### Load library
+```{r}
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(limma)
+library(edgeR)
+library(readxl)
+library(reshape2)
+library(survival)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(pathview)
+```
+
+
+### Data cleanning on TCGA and GTEx data
+```{r}
+SKSun_GTEx = read.table("data/gene_tpm_2017-06-05_v8_skin_sun_exposed_lower_leg.gct", header = TRUE, sep = "\t", check.names = F)
+
+SKNoSun_GTEx = read.table("data/gene_tpm_2017-06-05_v8_skin_not_sun_exposed_suprapubic.gct", header = TRUE, sep = "\t", check.names = F)
+
+SK_GTEx = merge(SKSun_GTEx, SKNoSun_GTEx, by = "Name") %>% select(-id.y, -Description.y, -id.x) %>% rename(Description = Description.x)
+
+write.table(SK_GTEx, file = "data/2024-06-02_Skin_GTEx_Sun_noSun.txt", sep = "\t", row.names = F, quote = F)
+
+SKCM_TCGA = read.table("data/TCGA-SKCM.htseq_fpkm.tsv", row.names = 1, header = TRUE, sep = "\t", check.names = F)
+
+SKCM_TCGA_FPKM = 2^SKCM_TCGA - 1
+
+SKCM_TCGA_TPM = SKCM_TCGA_FPKM
+# Convert FPKM to TPM
+for (col in colnames(SKCM_TCGA_TPM)) {
+  sum_fpkm <- sum(SKCM_TCGA_TPM[[col]])  # Use double brackets to get the column correctly
+  SKCM_TCGA_TPM[[col]] <- (SKCM_TCGA_TPM[[col]] / sum_fpkm) * 1e6
+}
+
+write.table(cbind(Gene = row.names(SKCM_TCGA_TPM), SKCM_TCGA_TPM), file = "data/2024-06-02_SKCM_TPM.txt", sep = "\t", row.names = F, quote = F)
+
+```
+
+### Perform DESeq between primary vs metastatic in TCGA
+```{r}
+#Load the data and prepare the data
+SKCM_TCGA_TPM = read.table("data/2024-06-02_SKCM_TPM.txt", row.names = 1, check.names = F, sep = "\t", header = T)
+
+primary_cols <- grep("01[A-Z]$", colnames(SKCM_TCGA_TPM), value = TRUE)
+metastasis_cols <- grep("06[A-Z]$", colnames(SKCM_TCGA_TPM), value = TRUE)
+
+
+SKCM_Pr_TPM = SKCM_TCGA_TPM[, primary_cols]
+SKCM_Mt_TPM = SKCM_TCGA_TPM[, metastasis_cols]
+
+combined_tpm_data <- cbind(SKCM_Pr_TPM, SKCM_Mt_TPM)
+# Filter the data
+
+average_threshold <- 0.5
+zero_threshold <- 0.8  # e.g., genes must be expressed in at least 20% of samples
+
+# Calculate the average expression of each gene across all samples
+average_expression <- rowMeans(combined_tpm_data)
+
+# Calculate the proportion of samples with zero expression for each gene
+proportion_zero <- rowMeans(combined_tpm_data == 0)
+
+# Filter out genes with average expression below the threshold and those with high proportion of zeroes
+filtered_tpm_data <- combined_tpm_data[average_expression > average_threshold & proportion_zero < zero_threshold, ]
+
+# Perform DEG
+group <- factor(c(rep("Pt", ncol(SKCM_Pr_TPM)), rep("Mt", ncol(SKCM_Mt_TPM))))
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+contrast_matrix <- makeContrasts(Mt_vs_Pt = Mt - Pt, levels = design)
+
+
+fit <- lmFit(filtered_tpm_data, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+
+fit2 <- eBayes(fit2)
+
+results <- topTable(fit2, coef = "Mt_vs_Pt", adjust.method = "BH", number = Inf)
+write.csv(results, "data/2024-06-04_MT_vs_PT_nolog_DEG_contrast.csv")
+
+```
+
+## Perform DESeq between normal GTEx vs primary TCGA
+```{r}
+GTEx = read.table("data/2024-06-02_Skin_GTEx_Sun_noSun.txt", row.names = 1, check.names = F, sep = "\t", header = T)
+
+ENSG_Genename = cbind(rownames(GTEx), GTEx[,1])
+colnames(ENSG_Genename) = c("ENSG", "Symbol")
+write.table(ENSG_Genename, file = "data/2024-06-20_ENSG_to_Symbol.txt", sep = "\t", row.names = F, quote = F)
+
+GTEx_rename = cbind(ENSG = sapply(strsplit(rownames(GTEx), "\\."), `[`, 1), GTEx)
+SKCM_Pr_TPM_rename = cbind(ENSG = sapply(strsplit(rownames(SKCM_Pr_TPM), "\\."), `[`, 1), SKCM_Pr_TPM)
+GTEx_TCGA_common = intersect(GTEx_rename$ENSG, SKCM_Pr_TPM_rename$ENSG)
+
+GTEx_rename_common = GTEx_rename %>% filter(ENSG %in% GTEx_TCGA_common)
+SKCM_Pr_rename_common = SKCM_Pr_TPM_rename %>% filter(ENSG %in% GTEx_TCGA_common)
+
+GTEx_rename_common_sum = as.data.table(GTEx_rename_common)[, lapply(.SD, sum, na.rm = TRUE), by = .(ENSG, Description)]
+
+GTEx_TCGA_Pr = merge(SKCM_Pr_rename_common, GTEx_rename_common_sum, by = "ENSG" ) %>%
+  select(-Description)
+
+rownames(GTEx_TCGA_Pr) = GTEx_TCGA_Pr$ENSG
+GTEx_TCGA_Pr = GTEx_TCGA_Pr %>% select(-ENSG)
+
+average_threshold <- 0.5
+zero_threshold <- 0.8  # e.g., genes must be expressed in at least 10% of samples
+
+# Calculate the average expression of each gene across all samples
+average_expression <- rowMeans(GTEx_TCGA_Pr)
+
+# Calculate the proportion of samples with zero expression for each gene
+proportion_zero <- rowMeans(GTEx_TCGA_Pr == 0)
+
+# Filter out genes with average expression below the threshold and those with high proportion of zeroes
+GTEx_TCGA_filtered <- GTEx_TCGA_Pr[average_expression > average_threshold & proportion_zero < zero_threshold, ]
+
+GTEx_filtered = GTEx_TCGA_filtered %>% select(starts_with("GTEx"))
+TCGA_filtered = GTEx_TCGA_filtered %>% select(starts_with("TCGA"))
+
+#write.table(cbind(ENSG = rownames(GTEx_filtered), GTEx_filtered), file = "data/2024-06-09_GTEx_filtered.txt", sep = "\t", row.names = F, quote = F)
+
+#write.table(cbind(ENSG = rownames(TCGA_filtered), TCGA_filtered), file = "data/2024-06-09_SKCM_Pr_filtered.txt", sep = "\t", row.names = F, quote = F)
+
+GTEx_filtered_t = GTEx_filtered %>% t() %>% as.data.frame()
+
+GTEx_filtered_t = cbind(Patient_ID = sapply(strsplit(rownames(GTEx_filtered_t), "-"), `[`, 2), GTEx_filtered_t)
+
+GTEx_ave = GTEx_filtered_t %>% group_by(Patient_ID) %>%
+    summarize(across(everything(), mean)) %>%
+  ungroup()
+
+GTEx_ave = as.data.frame(GTEx_ave)
+GTEx_ave = GTEx_ave[,-Patient_ID]
+row.names(GTEx_ave) = paste0("GTEx-", GTEx_ave$Patient_ID)
+
+GTEx_ave = GTEx_ave %>% select(-Patient_ID)
+
+GTEx_ave_t = GTEx_ave %>% t() %>% as.data.frame()
+
+GTEx_TCGA_final = cbind(GTEx_ave_t, TCGA_filtered)
+backup  = GTEx_TCGA_final
+
+# Normalize to TPM
+for (col in colnames(GTEx_TCGA_final)) {
+  sum_fpkm <- sum(GTEx_TCGA_final[[col]])  # Use double brackets to get the column correctly
+  GTEx_TCGA_final[[col]] <- (GTEx_TCGA_final[[col]] / sum_fpkm) * 1e6
+}
+
+write.table(cbind(ENSG = rownames(GTEx_TCGA_final), GTEx_TCGA_final), file = "data/2024-06-09_GTEx_SKCM_Pr_TPM.txt", sep = "\t", row.names = F, quote = F)
+
+```
+
+
+### Get common DEGs
+```{r}
+Pt_vs_normal = read.table("data/2024-06-09_PT_vs_GTEx_nolog_DEG_contrast.csv", sep = ",", header = T)
+
+PT_DEG = Pt_vs_normal %>% filter((logFC >= 1 | logFC <= -1) & adj.P.Val < 0.05)
+
+PT_DEG_ENSG = PT_DEG$X
+Mt_vs_Pt = read.table("data/2024-06-04_MT_vs_PT_nolog_DEG_contrast.csv", sep = ",", header = T)
+
+MT_DEG = Mt_vs_Pt %>% filter((logFC >= 1 | logFC <= -1) & adj.P.Val < 0.05)
+
+MT_DEG_ENSG = sub("\\..*", "", MT_DEG$X)
+
+common_DEG <- intersect(PT_DEG_ENSG, MT_DEG_ENSG)
+length(common_DEG)
+
+```
+
+### TCGA Survival analysis
+```{r}
+SKCM_Exp = read.table("data/2024-06-02_SKCM_TPM.txt", sep = "\t", header = T, row.names = 1)
+
+average_threshold <- 0.5
+zero_threshold <- 0.8  # e.g., genes must be expressed in at least 10% of samples
+
+# Calculate the average expression of each gene across all samples
+average_expression <- rowMeans(SKCM_Exp)
+
+# Calculate the proportion of samples with zero expression for each gene
+proportion_zero <- rowMeans(SKCM_Exp == 0)
+
+# Filter out genes with average expression below the threshold and those with high proportion of zeroes
+SKCM_Exp_filtered <- SKCM_Exp[average_expression > average_threshold & proportion_zero < zero_threshold, ]
+
+# Convert FPKM to TPM
+for (col in colnames(SKCM_Exp_filtered)) {
+  sum_col <- sum(SKCM_Exp_filtered[[col]])  # Use double brackets to get the column correctly
+  SKCM_Exp_filtered[[col]] <- (SKCM_Exp_filtered[[col]] / sum_col) * 1e6
+}
+
+SKCM_Exp_T = SKCM_Exp_filtered %>% (t) %>% as.data.frame()
+
+SKCM_Exp_T = cbind(PatientID = substr(row.names(SKCM_Exp_T), 1, nchar(row.names(SKCM_Exp_T)) - 4), SKCM_Exp_T) %>% group_by(PatientID) %>%
+  summarize(across(everything(), mean)) %>%
+  ungroup() %>% as.data.frame()
+
+
+SKCM_clinial = read.table("data/skcm_tcga_pan_can_atlas_2018/data_clinical_patient.txt", skip = 4, sep = "\t")
+
+colnames(SKCM_clinial) = SKCM_clinial[1,]
+SKCM_clinial = SKCM_clinial[-1,]
+SKCM_clinial$PATIENT_ID = gsub("-", ".", SKCM_clinial$PATIENT_ID)
+SKCM_clinial_OS = SKCM_clinial %>% dplyr::select(PATIENT_ID,OS_STATUS, OS_MONTHS) %>% mutate(OS_STATUS = ifelse(OS_STATUS == "1:DECEASED", 1, 0)) %>% filter(OS_MONTHS > 0)
+
+
+SKCM_Exp_OS = merge(SKCM_Exp_T, SKCM_clinial_OS, by.x = "PatientID", by.y = "PATIENT_ID", all = F)
+
+
+
+# Assuming your data frame is named df
+# Remove the PatientID column as it's not needed for the analysis
+data <- SKCM_Exp_OS %>% dplyr::select(-PatientID)
+
+# Extract the OS_Status and OS_Months columns
+OS_Status <- data$OS_STATUS
+OS_Months <- as.numeric(data$OS_MONTHS)
+
+# Create an empty data frame to store the results
+results <- data.frame(Gene = character(),
+                      coef = numeric(),
+                      exp_coef = numeric(),
+                      se = numeric(),
+                      z = numeric(),
+                      p = numeric(),
+                      stringsAsFactors = FALSE)
+
+# Loop through each gene column and perform Cox regression
+for (gene in colnames(data)[-c((ncol(data)-1), ncol(data))]) {
+  # Create a Cox model formula
+  formula <- as.formula(paste("Surv(OS_Months, OS_Status) ~", gene))
+  
+  # Fit the Cox model
+  cox_model <- coxph(formula, data = data)
+  
+  # Extract the summary of the Cox model
+  summary_cox <- summary(cox_model)
+  
+  # Extract the coefficients and other statistics
+  coef <- summary_cox$coefficients[1, "coef"]
+  exp_coef <- summary_cox$coefficients[1, "exp(coef)"]
+  se <- summary_cox$coefficients[1, "se(coef)"]
+  z <- summary_cox$coefficients[1, "z"]
+  p <- summary_cox$coefficients[1, "Pr(>|z|)"]
+  
+  # Append the results to the results data frame
+  results <- rbind(results, data.frame(Gene = gene, coef = coef, exp_coef = exp_coef, se = se, z = z, p = p))
+}
+
+# Print the summarized results
+print(results)
+
+results$adj_p <- p.adjust(results$p, method = "BH")
+
+write.table(results , "data/2024-06-21_SKCM_OS_Cox.txt", row.names = F, quote = F, sep = "\t")
+
+```
+
+### Make survival plot
+```{r}
+GoI_ENSG = c("ENSG00000129455", "ENSG00000155307", "ENSG00000170476", "ENSG00000123338", "ENSG00000105246")
+
+TCGA_OS = read.table("data/2024-06-21_SKCM_OS_Cox.txt", sep = "\t", header = T) 
+TCGA_OS$Gene <- sub("\\..*", "", TCGA_OS$Gene)
+
+TCGA_OS = TCGA_OS %>% filter(Gene %in% GoI_ENSG)
+
+# Calculate -log10(adj_p)
+TCGA_OS <- TCGA_OS %>%
+  mutate(HR = exp_coef,
+         lower_CI = exp(coef - 1.96 * se),
+         upper_CI = exp(coef + 1.96 * se),
+         neg_log10_adj_p = -log10(adj_p)) %>% left_join(Symbol_ENSG, by = c("Gene" = "ENSG"))
+# Specify the order of genes
+gene_order <- c("SAMSN1", "NCKAP1L", "MZB1", "KLK8", "EBI3")
+
+# Convert Gene column to a factor with the specified order
+TCGA_OS$GeneSymbol <- factor(TCGA_OS$GeneSymbol, levels = gene_order)
+
+# HR plot
+HR_plot =ggplot(TCGA_OS, aes(x = GeneSymbol, y = HR, color = neg_log10_adj_p)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = "Hazard Ratio (HR) Plot",
+       y = "Hazard Ratio (HR)",
+       color = "-log10(adj_p)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+### Print Venn diagram
+```{r}
+OS = read.table("data/2024-06-21_SKCM_OS_Cox.txt", sep = "\t", header = T) %>% filter(adj_p < 0.05)
+
+PT_DEG = read.table("data/2024-06-09_PT_vs_GTEx_nolog_DEG_contrast.csv", sep = ",", header = T) %>% filter(adj.P.Val < 0.05, abs(logFC) > 1)
+
+MT_DEG = read.table("data/2024-06-04_MT_vs_PT_nolog_DEG_contrast.csv", sep = ",", header = T) %>% filter(adj.P.Val < 0.05, abs(logFC) > 1) 
+
+
+
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+OS_ENSG <- sapply(strsplit(OS$Gene, "\\."), `[`, 1)
+
+PT_ENSG = PT_DEG$X
+MT_ENSG = sapply(strsplit(MT_DEG$X, "\\."), `[`, 1)
+
+
+DEG_genes = intersect(PT_ENSG, MT_ENSG)
+# Set up the Ensembl connection
+
+
+
+
+DEG_genes = intersect(PT_ENSG, MT_ENSG)
+
+OS_DEG_genes = intersect(OS_ENSG, DEG_genes)
+
+
+# Query the Ensembl database to get gene symbols
+OS_DEG_gene_sybol <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol'), 
+               filters = 'ensembl_gene_id', 
+               values = OS_DEG_genes, 
+               mart = ensembl)
+
+write.table(OS_DEG_gene_sybol, "data/2024-06-21_OS_DEG_gene.txt", sep = "\t", quote = F, row.names = F)
+
+# Creating the list of sets
+sets <- list(
+  "Primary_vs_normal" = PT_ENSG,
+  "Metastatic_vs_primary" = MT_ENSG,
+  "OS" = OS_ENSG
+)
+
+# Creating the Venn diagram
+Melaonoma_Venn = ggvenn(sets, 
+       fill_color = c("red", "green", "blue"),
+       stroke_size = 0.5, 
+       set_name_size = 6)
+ggsave("analysis/2024-06-21_Melanoma_Venn.pdf", Melaonoma_Venn, dpi = 300)
+
+# Make OS vocano plot
+OS = read.table("data/2024-06-21_SKCM_OS_Cox.txt", sep = "\t", header = T)
+OS$neg_log_p <- -log10(OS$adj_p)
+
+# Create the volcano plot
+# Create the volcano plot with specific colors
+p_cox = ggplot(OS, aes(x = exp_coef, y = neg_log_p)) +
+  geom_point(aes(color = adj_p < 0.05), alpha = 0.5, size = 0.1) + 
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot",
+       x = "Hazard Ratio (HR)",
+       y = "-log10 Ajusted P-Value") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave("analysis/2024-08-11_Melanoma_cox.pdf", p_cox, dpi = 300)
+
+
+```
+
+
+### GO analysis
+```{r}
+# Perform GO enrichment analysis using ENSG IDs for BP ontology
+ego_bp <- enrichGO(gene          = OS_DEG_genes,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'ENSEMBL',
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   qvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+ego_mf <- enrichGO(gene          = OS_DEG_genes,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'ENSEMBL',
+                   ont           = "MF",
+                   pAdjustMethod = "BH",
+                   qvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+ego_cc <- enrichGO(gene          = OS_DEG_genes,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'ENSEMBL',
+                   ont           = "CC",
+                   pAdjustMethod = "BH",
+                   qvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+# View the results
+head(ego_bp)
+
+# Plot the dotplot for Biological Process ontology
+plot_bp =  dotplot(ego_bp, showCategory = 20) + ggtitle("GO Enrichment Analysis - Biological Process")
+ggsave("analysis/2024-06-21_GO_BP_top20.pdf", plot_bp)
+
+plot_mf = dotplot(ego_mf, showCategory = 20) + ggtitle("GO Enrichment Analysis - Molecular Function")
+ggsave("analysis/2024-06-21_GO_MF_top20.pdf", plot_mf)
+
+
+plot_cc = dotplot(ego_cc, showCategory = 20) + ggtitle("GO Enrichment Analysis - Cellular Component")
+ggsave("analysis/2024-06-21_GO_CC_top20.pdf", plot_cc)
+
+significant_go_bp <- ego_bp@result[ego_bp@result$qvalue < 0.05, ]
+
+```
+
+
+
+### Print volcano plot
+```{r}
+fivegenes = c("ENSG00000105246",
+  "ENSG00000129455",
+  "ENSG00000170476",
+  "ENSG00000123338",
+  "ENSG00000155307")
+
+PT_DEG = read.table("data/2024-06-09_PT_vs_GTEx_nolog_DEG_contrast.csv", sep = ",", header = T)
+
+# Correct the mutate step to ensure capping is applied correctly
+PT_DEG <- PT_DEG %>% mutate(
+  significance = ifelse(adj.P.Val < 0.05 & abs(logFC) > 1, "Significant", "Not Significant"),
+  capped_logFC = ifelse(logFC < -50, -50, ifelse(logFC > 50, 50, logFC)),
+  capped_neg_log10_p_adj = ifelse(-log10(adj.P.Val) < 0, 0, ifelse(-log10(adj.P.Val) > 50, 50, -log10(adj.P.Val)))
+)
+
+# Create the volcano plot with the correct y-axis mapping
+PT_volcano_plot <- ggplot(PT_DEG, aes(x = capped_logFC, y = capped_neg_log10_p_adj, color = significance)) +
+  geom_point(alpha = 0.4, size = 0.2) +
+  scale_color_manual(values = c("blue", "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot",
+    x = "Log Fold Change (logFC)",
+    y = "-Log10 Adjusted P-Value",
+    color = "Significance"
+  ) +
+  xlim(-50, 50) +
+  ylim(0, 50) +
+  theme(legend.position = "top")
+
+ggsave("analysis/2024-06-22_PT_vs_Normal_volcano.pdf", PT_volcano_plot)
+
+
+MT_DEG = read.table("data/2024-06-04_MT_vs_PT_nolog_DEG_contrast.csv", sep = ",", header = T)
+
+# Correct the mutate step to ensure capping is applied correctly
+MT_DEG <- MT_DEG %>% mutate(
+  significance = ifelse(adj.P.Val < 0.05 & abs(logFC) > 1, "Significant", "Not Significant"),
+  capped_logFC = ifelse(logFC < -25, -25, ifelse(logFC > 25, 25, logFC)),
+  capped_neg_log10_p_adj = ifelse(-log10(adj.P.Val) < 0, 0, ifelse(-log10(adj.P.Val) > 20, 20, -log10(adj.P.Val)))
+)
+
+# Create the volcano plot with the correct y-axis mapping
+MT_volcano_plot <- ggplot(MT_DEG, aes(x = capped_logFC, y = capped_neg_log10_p_adj, color = significance)) +
+  geom_point(alpha = 0.4, size = 0.2) +
+  scale_color_manual(values = c("blue", "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot",
+    x = "Log Fold Change (logFC)",
+    y = "-Log10 Adjusted P-Value",
+    color = "Significance"
+  ) +
+  xlim(-25, 25) +
+  ylim(0, 20) +
+  theme(legend.position = "top")
+
+ggsave("analysis/2024-06-22_MT_vs_PT_volcano.pdf", MT_volcano_plot)
+# Display the plot
+print(PT_volcano_plot)
+
+
+Symbol_ENSG <- data.frame(
+  GeneSymbol = c("EBI3", "KLK8", "MZB1", "NCKAP1L", "SAMSN1"),
+  ENSG = c("ENSG00000105246", "ENSG00000129455", "ENSG00000170476", "ENSG00000123338", "ENSG00000155307"),
+  stringsAsFactors = FALSE
+)
+
+
+MT_DEG_5gene = MT_DEG %>% mutate(X = sapply(strsplit(X, "\\."), `[`, 1) ) %>% filter(X %in% fivegenes)  %>% left_join(Symbol_ENSG, by = c("X" = "ENSG"))
+
+MT_DEG_plot = ggplot(MT_DEG_5gene, aes(x = logFC, y = GeneSymbol, color = -log10(adj.P.Val))) +
+  geom_point(size = 3) +
+  #scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title = "Dot Plot of DEGs in Metastatic vs primary melanoma",
+    x = "Log Fold Change (logFC)",
+    y = "Gene Symbol",
+    color = "-Log10 Adjusted P-Value"
+  ) +
+  theme(legend.position = "top")
+ggsave("analysis/2024-06-23_Metastatic_vs_Primary.pdf", MT_DEG_plot)
+
+PT_DEG_5gene = PT_DEG %>% mutate(X = sapply(strsplit(X, "\\."), `[`, 1) ) %>% filter(X %in% fivegenes)  %>% left_join(Symbol_ENSG, by = c("X" = "ENSG"))
+
+PT_DEG_plot = ggplot(PT_DEG_5gene, aes(x = logFC, y = GeneSymbol, color = -log10(adj.P.Val))) +
+  geom_point(size = 3) +
+  #scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title = "Dot Plot of DEGs in primary melanoma vs normal skin",
+    x = "Log Fold Change (logFC)",
+    y = "Gene Symbol",
+    color = "-Log10 Adjusted P-Value"
+  ) +
+  theme(legend.position = "top")
+ggsave("analysis/2024-06-23_Primary_vs_normal.pdf", PT_DEG_plot)
+
+
+```
+
+
+### mel_dfci_2019 data cleaning
+```{r}
+MSK = read.table("data/mel_dfci_2019/data_mrna_seq_tpm.txt", sep = "\t", header = T)
+# Create a named vector to map incorrect symbols to the correct ones
+correct_mapping <- c(
+  "1-Mar" = "MARCH1", "10-Mar" = "MARCH10", "11-Sep" = "SEPT11", 
+  "1-Sep" = "SEPT1", "2-Mar" = "MARCH2", "2-Sep" = "SEPT2",
+  "3-Mar" = "MARCH3", "3-Sep" = "SEPT3", "4-Sep" = "SEPT4",
+  "5-Mar" = "MARCH5", "5-Sep" = "SEPT5", "6-Mar" = "MARCH6", 
+  "6-Sep" = "SEPT6", "7-Mar" = "MARCH7", "7-Sep" = "SEPT7",
+  "8-Mar" = "MARCH8", "8-Sep" = "SEPT8", "9-Mar" = "MARCH9", 
+  "9-Sep" = "SEPT9", "10-Sep" = "SEPT10"
+)
+
+# Replace the incorrect symbols with the correct ones
+MSK$Hugo_Symbol <- ifelse(MSK$Hugo_Symbol %in% names(correct_mapping), 
+                          correct_mapping[MSK$Hugo_Symbol], 
+                          MSK$Hugo_Symbol)
+
+# Verify the correction
+head(MSK$Hugo_Symbol, 25)
+MSK$Entrez_Gene_Id = NULL
+MSK = MSK %>% group_by(Hugo_Symbol) %>%
+  summarize(across(everything(), sum)) %>% 
+  filter(Hugo_Symbol > 0) %>% as.data.frame()
+
+
+row.names(MSK) <- MSK$Hugo_Symbol
+MSK$Hugo_Symbol = NULL
+
+for (col in colnames(MSK)) {
+  sum_fpkm <- sum(MSK[[col]])  # Use double brackets to get the column correctly
+  MSK[[col]] <- (MSK[[col]] / sum_fpkm) * 1e6
+}
+
+GoI = c("EBI3", "KLK8", "MZB1", "NCKAP1L", "SAMSN1")
+
+write.table(cbind(Gene = row.names(MSK), MSK), file = "data/2024-08-16_MSK_TPM.txt", sep = "\t", row.names = F, quote = F)
+
+
+```
+
+
+### mel_dfci_2019 analysis
+```{r}
+
+MSK_exp = read.table("data/2024-08-16_MSK_TPM.txt", header = T, sep = "\t", row.names = 1) %>% filter(row.names(.) %in% IRG)
+
+MSK_exp_T = MSK_exp %>% (t) %>% as.data.frame()
+
+MSK_exp_T = cbind(PatientID = row.names(MSK_exp_T), MSK_exp_T)
+
+MSK_fraction = read.table("data/2024-08-16_MSK_GEP/CIBERSORTxGEP_Job48_Fractions-Adjusted.txt", header = T, sep = "\t", row.names = 1)
+
+MSK_fraction = cbind(PatientID = row.names(MSK_fraction), MSK_fraction)
+
+MSK_fraction_exp = merge(MSK_exp_T, MSK_fraction, by = "PatientID")
+
+# Initialize a results data frame
+results_MSK <- data.frame(Gene = character(), Correlation = numeric(), P_Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each gene column (excluding the T_CD8_fraction column)
+for (gene in colnames(MSK_fraction_exp)[colnames(MSK_fraction_exp) %in% IRG]) {
+  
+  # Perform correlation test
+  cor_test <- cor.test(log(MSK_fraction_exp[[gene]]+1), log(MSK_fraction_exp$T.cells.CD8 + 0.00001))
+  
+  # Store the results
+  results_MSK <- rbind(results_MSK, data.frame(Gene = gene, Correlation = cor_test$estimate, P_Value = cor_test$p.value))
+}
+
+# Print the results
+results_MSK$adj_p <- p.adjust(results_MSK$P_Value, method = "BH")
+# Create a column for -log10(P-value)
+results_MSK$logP_adj <- -log10(results_MSK$adj_p)
+
+# Define your gene list to show
+GeneShow <- c("B2M", GoI, "CD8A", "CD8B", "IL2RB", "PRF1", "JAK3", "PDCD1", "TNFSF10")
+
+# Create the volcano plot
+cor_plot = ggplot(results_MSK, aes(x = Correlation, y = logP_adj)) +
+  geom_point(aes(color = logP_adj > -log10(0.05)), size = 1) + # Highlight significant points
+  geom_label_repel(
+    data = subset(results_MSK, logP_adj > -log10(0.05) & Gene %in% GeneShow), 
+    aes(label = Gene), 
+    size = 4, 
+    #box.padding = 0.2,
+    min.segment.length = 0,
+    segment.color = 'grey50', # Line color
+    segment.size = 0.7,  # Line thickness
+    force = 10,           # Increase force to push labels away
+    max.overlaps = Inf,   # Allow more overlaps before removing labels
+    xlim = c(-Inf, Inf), ylim = c(-Inf, Inf)
+  ) + 
+  theme_minimal() +
+  coord_cartesian(clip = "off") +
+  labs(title = "Volcano Plot",
+       x = "Correlation",
+       y = "-log10(p.adj)",
+       color = "Significant") +
+  scale_color_manual(values = c("black", "red")) # Red for significant, black for non-significant
+
+
+```
+
+
+### Read scRNA-GSE115978
+```{r}
+# Read the annotations file
+annotations <- read.table("data/2024-06-21_melanoma_scRNASeq/GSE115978/GSE115978_cell.annotations.csv.gz", header = T, row.names = 1, sep = ",")
+
+annotations = annotations %>% mutate(CellType = case_when(
+    cell.types %in% c("T.CD4", "T.CD8", "T.cell") ~ "T.cell",
+    cell.types == "?" ~ "not defined",
+    TRUE ~ cell.types))
+
+# Read the counts file
+counts <- read.table("data/2024-06-21_melanoma_scRNASeq/GSE115978/GSE115978_counts.csv.gz", header = T, row.names = 1, sep = ",")
+
+# Create Seurat object from counts data
+GSE115978_obj <- CreateSeuratObject(counts = counts, project = "GSE115978")
+
+# Add cell annotations as metadata
+GSE115978_obj <- AddMetaData(object = GSE115978_obj, metadata = annotations)
+
+
+GSE115978_obj = subset(GSE115978_obj, nCount_RNA < 3e6 & CellType != "not defined")
+
+
+
+# Normalizing the data
+GSE115978_obj <- NormalizeData(GSE115978_obj)
+
+# Identifying the 2000 most variable genes
+GSE115978_obj <- FindVariableFeatures(GSE115978_obj, selection.method = "vst", nfeatures = 3000)
+
+# Scaling the data
+seurat_obj <- ScaleData(seurat_obj, features = rownames(seurat_obj))
+
+# Running PCA
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(object = seurat_obj))
+
+# Running UMAP
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:15)
+
+seurat_obj_filter = subset(seurat_obj, nCount_RNA < 3e6 & cell.types != "?")
+
+# Plotting UMAP
+seurat_UMAP <- DimPlot(seurat_obj, reduction = "umap", group.by = "cell.types")
+
+# Run UMAP
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:15)
+
+# Visualize UMAP with cell identities
+DimPlot(seurat_obj, reduction = "umap", group.by = "cell_type")  # Replace "ce
+
+
+# Verify the Seurat object
+print(seurat_obj)
+
+# Save the Seurat object
+
+
+# Set identities based on 'malignant.1.no.2.yes.0.unresolved.'
+seurat_obj_filter <- SetIdent(seurat_obj_filter, value = seurat_obj_filter@meta.data$cell.types)
+
+GOI = c("EBI3", "KLK8", "MZB1", "NCKAP1L", "SAMSN1")
+FeaturePlot(seurat_obj_filter, features = GOI)
+
+seurat_UMAP <- DimPlot(seurat_obj_filter, reduction = "umap", group.by = "cell.types")
+saveRDS(seurat_obj, file = "GSE115978_seurat_obj.rds")
+
+# Find markers between group 1 (non-malignant) and group 2 (malignant)
+diff_genes <- FindMarkers(seurat_obj_filter, ident.1 = "Mal")
+
+write.table(diff_genes, file = "data/2024-06-21_melanoma_scRNASeq/GSE115978/GSE115978_differential_genes.txt", sep = "\t", quote = FALSE, row.names = TRUE)
+```
+
+
+### Read scRNA-GSE72056
+```{r}
+# Step 1: Read the data
+
+# Read in entire file
+GSE72056 <- read.delim("data/2024-06-21_melanoma_scRNASeq/GSE72056/GSE72056_melanoma_single_cell_revised_v2.txt", header = T, stringsAsFactors = F)
+
+# Pull only gene information
+GSE72056_genes <- GSE72056[-1:-3,]
+
+# Duplicate gene names so make names unique (up to you how you want to deal with this part)
+gene_list <- GSE72056_genes %>% 
+  pull("Cell") %>% 
+  make.unique(sep = ".")
+
+# Add back unique rownames
+rownames(GSE72056_genes) <- gene_list
+
+# Remove Column of gene names
+GSE72056_genes <- GSE72056_genes[, -1]
+
+# Pull meta data columns from original data
+GSE72056_meta <- GSE72056[1:3,]
+
+# Make rownames equal to column 1 values
+rownames(GSE72056_meta) <- GSE72056_meta[, 1]
+
+# Remove column 1
+GSE72056_meta <- GSE72056_meta[, -1]
+
+# Transpose meta data as Seurat expects meta data to have cell names as rows and meta data values as columns
+GSE72056_meta_transpose <- data.frame(t(GSE72056_meta)) %>% mutate(CellType = case_when(
+    malignant.1.no.2.yes.0.unresolved. == "0" ~ "not defined",
+    malignant.1.no.2.yes.0.unresolved. == "2" ~ "Mal",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "1" ~ "T.cell",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "2" ~ "B.cell",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "3" ~ "Macrophage",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "4" ~ "Endo.",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "5" ~ "CAF",
+    non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK. == "6" ~ "NK"))
+
+GSE72056_meta_transpose$CellType[is.na(GSE72056_meta_transpose$CellType)] <- "not defined"
+# Create Seurat Object
+GSE72056_obj <- CreateSeuratObject(counts = GSE72056_genes, meta.data = GSE72056_meta_transpose)
+
+GSE72056_obj = subset(GSE72056_obj, CellType != "not defined")
+
+# Normalizing the data
+GSE72056_obj <- NormalizeData(GSE72056_obj)
+
+# Identifying the 2000 most variable genes
+GSE72056_obj <- FindVariableFeatures(GSE72056_obj)
+
+# Scaling the data
+GSE72056_obj <- ScaleData(GSE72056_obj, features = rownames(GSE72056_seurat))
+
+# Running PCA
+GSE72056_seurat <- RunPCA(GSE72056_seurat, features = VariableFeatures(object = GSE72056_seurat))
+
+# Running UMAP
+GSE72056_seurat <- RunUMAP(GSE72056_seurat, dims = 1:15)
+
+# Plotting UMAP
+GSE72056_UMAP <- DimPlot(GSE72056_seurat, reduction = "umap", group.by = "non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK.")
+GSE72056_UMAP2 <- DimPlot(GSE72056_seurat, reduction = "umap", group.by = "malignant.1.no.2.yes.0.unresolved.")
+UMAPPlot
+
+GSE72056_seurat = subset(GSE72056_seurat, malignant.1.no.2.yes.0.unresolved. != 0)
+# Set identities based on 'malignant.1.no.2.yes.0.unresolved.'
+GSE72056_seurat <- SetIdent(GSE72056_seurat, value = GSE72056_seurat@meta.data$malignant.1.no.2.yes.0.unresolved.)
+
+
+# Find markers between group 1 (non-malignant) and group 2 (malignant)
+diff_genes <- FindMarkers(GSE72056_seurat, ident.1 = 1, ident.2 = 2)
+FeaturePlot(GSE72056_seurat, features = GOI)
+
+write.table(diff_genes, file = "data/2024-06-21_melanoma_scRNASeq/GSE72056_differential_genes.txt", sep = "\t", quote = FALSE, row.names = TRUE)
+GSE72056_UMAP2
+```
+
+### Perform Merge of the two scRNA data
+```{r}
+GSE72056_obj$Method = "GSE72056"
+GSE115978_obj$Method = "GSE115978"
+combined_obj <- merge(GSE72056_obj, y = GSE115978_obj)
+
+# run standard analysis workflow
+combined_obj <- NormalizeData(combined_obj)
+combined_obj <- FindVariableFeatures(combined_obj)
+combined_obj <- ScaleData(combined_obj)
+combined_obj <- RunPCA(combined_obj)
+
+#ElbowPlot(combined_obj)
+combined_obj <- RunUMAP(combined_obj, dims = 1:15, reduction = "pca", reduction.name = "umap.unintegrated")
+combined_obj_Dim_NoInt = DimPlot(combined_obj, reduction = "umap.unintegrated", group.by = c("Method", "CellType"))
+
+# Integrate
+combined_obj_int <- IntegrateLayers(object = combined_obj, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", verbose = FALSE)
+#combined_obj_int <- JoinLayers(combined_obj_int[["RNA"]])
+
+combined_obj_int <- FindNeighbors(combined_obj_int, dims = 1:15, reduction = "integrated.cca")
+
+combined_obj_int <- FindClusters(combined_obj_int, resolution = 0.2)
+combined_obj_int <- RunUMAP(combined_obj_int, dims = 1:15, reduction = "integrated.cca")
+
+combined_obj_int_method = DimPlot(combined_obj_int, reduction = "umap", group.by = c("Method"))
+combined_obj_int_celltype = DimPlot(combined_obj_int, reduction = "umap", group.by = c("CellType"),  label = T)
+combined_obj_int_celltype2 = DimPlot(combined_obj_int, reduction = "umap", group.by = c("cell.types"),  label = T)
+combined_obj_int_celltype3 = DimPlot(combined_obj_int, reduction = "umap", group.by = c("non.malignant.cell.type..1.T.2.B.3.Macro.4.Endo..5.CAF.6.NK."),  label = T)
+
+combined_obj_int_cluster = DimPlot(combined_obj_int, reduction = "umap", label = T)
+
+combined_obj_int_annotation <- data.frame(cluster_ID = combined_obj_int@active.ident, row.names = rownames(combined_obj_int@meta.data)) %>% mutate(CellType_int = case_when(
+  cluster_ID %in% c("0", "9") ~ "T_CD8", 
+  cluster_ID == "1" ~ "T_CD4", 
+  cluster_ID %in% c("2", "4", "6", "7", "10") ~ "Melanoma", 
+  cluster_ID == "3" ~ "B_cell", 
+  cluster_ID == "5" ~ "Macrophage",
+  cluster_ID == "8" ~ "NK",
+  cluster_ID == "11" ~ "CAF",
+  cluster_ID %in% c("12","13") ~ "Endothelial"))
+  
+combined_obj_int = AddMetaData(combined_obj_int, metadata = combined_obj_int_annotation, col.name = "CellType_int")
+combined_obj_int_celltype_final = DimPlot(combined_obj_int, reduction = "umap", group.by = c("CellType_int"), label = T) + NoLegend()
+c("T_cell", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T", "FCGR3A+ Mono",
+    "NK", "DC", "Platelet")
+
+
+
+MZB_Feature = FeaturePlot(combined_obj_int, features = GoI, reduction = "umap")
+
+MZB_Dot = DotPlot(combined_obj_int, features = GoI,  dot.scale = 8, group.by = "CellType_int") + RotatedAxis()
+
+saveRDS(combined_obj_int, "data/2024-09-09_melanoma_integrated.rds")
+
+## Make more plots
+combined_obj = readRDS("data/2024-09-09_melanoma_integrated.rds")
+SERB4_Feature = FeaturePlot(combined_obj, features = "SERPINB4", reduction = "umap")
+SERB4_Dot = DotPlot(combined_obj, features = "SERPINB4",  dot.scale = 8, group.by = "CellType_int") + RotatedAxis()
+
+```
+
+### Print fraction plot
+```{r}
+
+
+# Load the data from the Excel file
+file_path <- "manuscript/TableS6_CellFractionofMelanomaTumor.xlsx"
+cell_fraction_data <- read_excel(file_path, sheet = "TableS6_Cell_Fraction")
+
+cell_fraction_data$Mixture <- gsub("Sample", "", cell_fraction_data$Mixture)
+
+
+# Sort the data by 'Malignant' fraction in ascending order
+cell_fraction_data <- cell_fraction_data %>%
+  arrange(`Malignant`)
+
+# Reshape the data into long format
+cell_fraction_long <- melt(cell_fraction_data, id.vars = "Mixture", 
+                           measure.vars = colnames(cell_fraction_data)[2:9], 
+                           variable.name = "Cell_Type", value.name = "Cell_Fraction")
+
+# Ensure the Mixture (sample IDs) are a factor and ordered by 'Malignant'
+cell_fraction_long$Mixture <- factor(cell_fraction_long$Mixture, levels = cell_fraction_data$Mixture)
+
+# Reorder Cell_Type so that 'Malignant' comes first, so it appears on top of the stack
+cell_fraction_long$Cell_Type <- factor(cell_fraction_long$Cell_Type, 
+                                       levels = c("Malignant", setdiff(unique(cell_fraction_long$Cell_Type), "Malignant")))
+
+# Create the stacked bar plot
+p = ggplot(cell_fraction_long, aes(x = Mixture, y = Cell_Fraction, fill = Cell_Type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Cell Fractions by Sample ID (Sorted by Malignant)", 
+       x = "Sample ID", 
+       y = "Cell Fraction (Stacked)") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_brewer(palette = "Set3")
+```
+
