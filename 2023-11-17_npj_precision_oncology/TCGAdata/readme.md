@@ -1,7 +1,7 @@
-## Content
-### "Numb_isoforms_TPM_TCGA.xlsx"
-This file contains Numb isoform expression within TCGA and GTEx data.
-### "12-2022_Numb_isoforms_TPM_TCGA.xlsx"
-This file contains the expression of several genes and patient surviva data from TCGA melanoma cohort.
-### "GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
-This file contains sample annotations for the GTEx cohort.
+# Processed Input Tables
+
+| File | Contents |
+|---|---|
+| `Numb_isoforms_TPM_TCGA.xlsx` | NUMB isoform expression (TPM) in TCGA melanoma and GTEx skin |
+| `12-2022_PLK1NUMB_v2.xlsx` | Expression of PLK1, NUMB, and related genes with patient survival for the TCGA melanoma cohort |
+| `GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt` | GTEx v8 sample annotations (tissue of origin) |
